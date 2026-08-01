@@ -1,0 +1,11 @@
+# Esclude la cartella con i 7.000 file audio
+meta/
+dataset/
+
+# Esclude i file di dati pesanti generati dagli script
+*.npz
+*.npy
+
+# Esclude ambienti virtuali Python e cache
+venv/
+__pycache__/

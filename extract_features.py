@@ -1,102 +1,111 @@
 import os
-import librosa
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
+import librosa
+from tqdm import tqdm  # <-- Importazione della barra di avanzamento
 
-# Configurazioni
-DATASET_PATH = "dataset"
-SR = 16000             # Frequenza di campionamento (16 kHz, ideale per il Pico)
-DURATION = 1           # Finestre da 1 secondo
-CHUNK_SAMPLES = SR * DURATION 
-N_MFCC = 32            # Numero di bande di frequenza (Asse Y dell'"immagine")
-HOP_LENGTH = 512       # Risoluzione temporale (Asse X dell'"immagine")
+# --- 1. CONFIGURAZIONE ---
+DATASET_PATH = "dataset" # Cartella principale che contiene le tue 8 categorie
+OUTPUT_FILE = "dataset_features.npz"
 
-X = []
-y_text = []
+SAMPLE_RATE = 16000
+DURATION = 2.0  # <-- Incrementato a 2 secondi per maggiore contesto!
+SAMPLES_PER_TRACK = int(SAMPLE_RATE * DURATION)
 
-print("Inizio estrazione feature audio... (potrebbe richiedere qualche minuto)")
+# Parametri Log-Mel Spectrogram (Stato dell'arte per embedded)
+N_MELS = 40
+HOP_LENGTH = 512
+N_FFT = 1024
 
-# Dizionario di mapping: "nome_cartella" -> "macro_classe"
-class_mapping = {
-    # 0_Normale (Rumori di fondo, natura, meteo e normale attività urbana)
-    "airplane": "0_Normale", 
-    "can_opening": "0_Normale", 
-    "car_passing": "0_Normale",
-    "cat": "0_Normale", 
-    "chirping_birds": "0_Normale", 
-    "church_bells": "0_Normale",
-    "clapping": "0_Normale", 
-    "crickets": "0_Normale", 
-    "crowd": "0_Normale",
-    "footsteps": "0_Normale", 
-    "rain": "0_Normale", 
-    "thunderstorm": "0_Normale",
-    "train": "0_Normale", 
-    "wind": "0_Normale",
+# Limiti per la Normalizzazione Globale dei Decibel
+MIN_DB = -80.0
+MAX_DB = 20.0
 
-    # 1_Disturbo (Inquinamento acustico, eventi fastidiosi da loggare)
-    "car_horn": "1_Disturbo", 
-    "dog": "1_Disturbo",
-    "engine": "1_Disturbo", 
-    "helicopter": "1_Disturbo",
+# Le tue 8 categorie esatte
+CATEGORIE = [
+    "Attività_Umana",
+    "Ambiente_Urbano",
+    "Veicoli",
+    "Sirene_e_Urla",
+    "Spari",
+    "Incidente",
+    "Vetri",
+    "Fuochi"
+]
 
-    # 2_Emergenza (Situazioni anomale che richiedono un controllo visivo)
-    "crying_baby": "2_Emergenza", 
-    "siren": "2_Emergenza",
-
-    # 3_Pericolo_Critico (Allarmi rossi di sicurezza pubblica)
-    "crackling_fire": "3_Pericolo_Critico",  # Fuoco non autorizzato in piazza
-    "fireworks": "3_Pericolo_Critico",       # Spesso illegali o confondibili con spari
-    "glass_breaking": "3_Pericolo_Critico"   # Vandalismo, effrazione o incidenti
-}
-
-print("Elaborazione e raggruppamento in Macro-Classi...")
-
-for label in os.listdir(DATASET_PATH):
-    # Se la cartella non è nel nostro mapping (es. suoni scartati come 'sneezing'), la saltiamo
-    if label not in class_mapping:
-        continue
-        
-    macro_class = class_mapping[label]
-    folder_path = os.path.join(DATASET_PATH, label)
+def process_audio(file_path):
+    """
+    Carica l'audio (WAV o MP3), lo porta a 16kHz mono, 
+    ne fissa la durata a 2 secondi e ne estrae il Log-Mel Spectrogramma.
+    """
+    audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
     
-    for file in os.listdir(folder_path):
-        if not file.lower().endswith((".wav", ".mp3")):
+    # 1. Taglio o Padding per avere esattamente 2.0 secondi
+    if len(audio) > SAMPLES_PER_TRACK:
+        audio = audio[:SAMPLES_PER_TRACK]
+    elif len(audio) < SAMPLES_PER_TRACK:
+        audio = np.pad(audio, (0, SAMPLES_PER_TRACK - len(audio)), 'constant')
+        
+    # 2. Creazione dello Spettrogramma di potenza (Mel Scale)
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio, sr=SAMPLE_RATE, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH
+    )
+    
+    # 3. Conversione in Decibel con riferimento assoluto (ref=1.0)
+    log_mel = librosa.power_to_db(mel_spec, ref=1.0)
+    
+    # 4. Normalizzazione Globale (Mantiene i volumi reali)
+    log_mel = np.clip(log_mel, MIN_DB, MAX_DB)
+    log_mel = (log_mel - MIN_DB) / (MAX_DB - MIN_DB)
+    
+    # 5. Aggiunta della dimensione del canale (TensorFlow richiede X, Y, Canali)
+    return log_mel[..., np.newaxis]
+
+if __name__ == "__main__":
+    print("Inizio estrazione feature allo stato dell'arte (Finestra: 2.0 secondi)...\n")
+    
+    X, y = [], []
+    file_processati = 0
+    file_scartati = 0
+    
+    for label_idx, folder in enumerate(CATEGORIE):
+        folder_path = os.path.join(DATASET_PATH, folder)
+        
+        if not os.path.isdir(folder_path):
+            print(f"⚠️  ATTENZIONE: Cartella mancante -> {folder}")
             continue
             
-        file_path = os.path.join(folder_path, file)
+        # Filtra in anticipo solo i file audio per dare a tqdm un conteggio accurato
+        file_audio_validi = [f for f in os.listdir(folder_path) if f.lower().endswith((".wav", ".mp3"))]
         
-        try:
-            audio, _ = librosa.load(file_path, sr=SR)
-            for i in range(0, len(audio) - CHUNK_SAMPLES + 1, CHUNK_SAMPLES):
-                chunk = audio[i : i + CHUNK_SAMPLES]
-                mfcc = librosa.feature.mfcc(y=chunk, sr=SR, n_mfcc=N_MFCC, hop_length=HOP_LENGTH)
-                
-                X.append(mfcc)
-                # Invece di salvare il nome della cartella, salviamo la macro-classe!
-                y_text.append(macro_class)
-        except Exception as e:
-            pass
+        if not file_audio_validi:
+            print(f"Nessun file audio trovato nella cartella: {folder}")
+            continue
+        
+        # Inizializza la barra di avanzamento per la categoria corrente
+        for filename in tqdm(file_audio_validi, desc=f"Elaborando {folder: <16}", unit="file"):
+            filepath = os.path.join(folder_path, filename)
+            try:
+                features = process_audio(filepath)
+                X.append(features)
+                y.append(label_idx)
+                file_processati += 1
+            except Exception as e:
+                # Usiamo tqdm.write al posto di print per non spezzare visivamente la barra
+                tqdm.write(f"   [!] Errore nel file {filename}: {e}")
+                file_scartati += 1
 
-# Conversione in array NumPy
-X = np.array(X)
-y_text = np.array(y_text)
+    # Conversione in matrici Numpy ottimizzate per il training
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.int32)
+    classes = np.array(CATEGORIE)
 
-# 1. Aggiungiamo una dimensione finale "fittizia" (il canale colore).
-# Le CNN si aspettano una forma (altezza, larghezza, canali). Per noi è 1 canale (monocromatico).
-# La forma finale diventerà circa (N_campioni, 16, 32, 1)
-X = X[..., np.newaxis]
-
-# 2. Codifica delle etichette testuali (es. "dog" -> 0, "rain" -> 1)
-encoder = LabelEncoder()
-y_encoded = encoder.fit_transform(y_text)
-
-# Salvataggio dei tensori su disco per l'addestramento
-np.save("X_data.npy", X)
-np.save("y_labels.npy", y_encoded)
-np.save("classes.npy", encoder.classes_)
-
-print(f"\nOperazione completata con successo!")
-print(f"Formato Tensore di Input (X): {X.shape}")
-print(f"Categorie trovate ({len(encoder.classes_)}): {encoder.classes_}")
-print("I file X_data.npy, y_labels.npy e classes.npy sono pronti per la CNN.")
+    # Salvataggio del blocco dati
+    np.savez(OUTPUT_FILE, X=X, y=y, classes=classes)
+    
+    print("\n" + "="*40)
+    print("ESTRAZIONE COMPLETATA CON SUCCESSO!")
+    print(f"File processati validi: {file_processati}")
+    print(f"File saltati/corrotti:  {file_scartati}")
+    print(f"Dimensioni matrice X:   {X.shape} (File, Mel-Bands, Time-Frames, Canale)")
+    print(f"File salvato:           {OUTPUT_FILE}")
+    print("="*40)
