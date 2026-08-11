@@ -1,0 +1,52 @@
+# Dipendenze del progetto Smart City Audio (lato PC).
+# Ricavate dagli import effettivi di tutti gli script, non a memoria.
+#
+#   pip install -r requirements.txt
+#
+# Nota su Linux e WSL: sounddevice e' un involucro attorno alla libreria di
+# sistema PortAudio, che pip NON installa. Serve anche:
+#   sudo apt install libportaudio2
+# Su Windows PortAudio arriva dentro il pacchetto e non serve altro.
+
+# --- calcolo numerico: usato praticamente ovunque -------------------------
+numpy>=1.24
+
+# --- analisi audio --------------------------------------------------------
+# librosa: spettrogrammi mel, rilevamento onset, ricampionamento
+#   extract_features.py, gen_mel_header.py, clean_dataset.py,
+#   augment_class.py, fine_tune.py, test_audio.py, make_rnn_dataset.py,
+#   harvest_pico.py
+librosa>=0.10
+# soundfile: lettura e scrittura wav
+#   clean_dataset.py, augment_class.py, dashboard_pico.py
+soundfile>=0.12
+# scipy: filtri Butterworth e convoluzione per l'augmentation
+#   augment_class.py
+scipy>=1.10
+
+# --- addestramento e quantizzazione ---------------------------------------
+# tensorflow: modello, conversione TFLite, interprete int8
+#   train_model.py, quantize_model.py, fine_tune.py, test_audio.py,
+#   make_rnn_dataset.py, train_rnn.py
+# La 2.20 rimuove tf.lite.Interpreter (deprecato): se aggiorni, va sostituito
+# con ai-edge-litert in tutti gli script che lo usano.
+tensorflow>=2.15,<2.20
+# scikit-learn: split stratificato, pesi per classe, matrice di confusione
+#   train_model.py, fine_tune.py, train_rnn.py
+scikit-learn>=1.3
+# tqdm: barra di avanzamento durante l'estrazione delle feature
+#   extract_features.py
+tqdm>=4.65
+
+# --- comunicazione con il Pico --------------------------------------------
+# pyserial: porta seriale USB (il modulo si importa come "serial")
+#   read_pico.py, dashboard_pico.py, record_pico.py, harvest_pico.py
+pyserial>=3.5
+
+# --- riproduzione e cruscotto ---------------------------------------------
+# sounddevice: riproduce i campioni dalla cassa
+#   harvest_pico.py (raccolta dataset), dashboard_pico.py (pulsante demo)
+sounddevice>=0.4
+# matplotlib: i grafici in tempo reale
+#   dashboard_pico.py
+matplotlib>=3.7
