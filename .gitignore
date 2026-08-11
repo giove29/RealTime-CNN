@@ -1,10 +1,28 @@
 # Esclude la cartella con i 7.000 file audio
 meta/
 dataset/
+claude/
+2heavy/
+tests/
+registrazioni_auto/
 
 # Esclude i file di dati pesanti generati dagli script
 *.npz
 *.npy
+*.h
+*.h5
+*.tflite
+
+# Esclude file singoli non più utili
+clean_dataset.py
+gen_mel_header.py
+harvest_pico.py
+make_rnn_dataset.py
+model_data.cc
+model_temporal_data.cc
+record_pico.py
+test_audio.py
+test.wav
 
 # Esclude ambienti virtuali Python e cache
 venv/
