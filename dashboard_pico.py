@@ -69,7 +69,7 @@ MARGINE_DEMO = 0.3
 # main.cpp: li' e' espresso in cicli da 0,5 s (20 cicli = 10 s). Governa solo
 # le clip innescate da uno stato pericoloso ("tipo=clip"): le registrazioni
 # manuali da 'r' ("tipo=rec") non passano da questo vincolo nel firmware.
-TEMPO_MORTO_CLIP = 10.0
+TEMPO_MORTO_CLIP = 15.0
 
 # Ordine con cui il firmware manda le probabilita' nel campo "p".
 # Deve coincidere con l'array CATEGORIE del main.cpp.
