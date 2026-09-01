@@ -11,14 +11,22 @@ Mostra le due logiche del sistema:
   2. macchina a stati  - scenario da regole deterministiche, con livelli
                          smorzati per le classi continue, eventi con
                          refrattarieta' per quelle impulsive, e precondizioni
-                         (senza veicoli recenti non puo' esserci un incidente)
+                         (senza veicoli/persone nell'ultimo secondo non puo'
+                         esserci un incidente)
 
 Il modello temporale appreso e' stato rimosso dal firmware: si fermava al 76%
 sugli scenari, con f1 0,54 sullo sparo singolo, e la macchina a stati copre
 meglio proprio i casi puntuali dove quello sbagliava.
 
 Salva anche le clip di prova che il Pico riversa quando riconosce un evento
-pericoloso: intercetta i marcatori #AUDIO START / #AUDIO END e scrive un WAV.
+pericoloso: intercetta i marcatori #AUDIO START / #AUDIO END e scrive un WAV,
+con il nome che riporta lo stato della macchina al momento dell'innesco e la
+data/ora del salvataggio.
+
+Un countdown a schermo indica quanto manca prima che una nuova clip possa
+essere accettata: il firmware impone un tempo morto fra un riversamento e il
+successivo (vedi TEMPO_MORTO_CLIP qui sotto, deve coincidere con TEMPO_MORTO
+nel main.cpp).
 
 Requisiti:
     pip install matplotlib pyserial
@@ -56,6 +64,12 @@ DURATA_CIECA = 1.5
 # Legato a DURATA_CIECA e non fissato a mano: se un giorno cambi la finestra,
 # il ritardo la segue senza doversene ricordare.
 MARGINE_DEMO = 0.3
+
+# Tempo morto fra due clip di allerta. Deve coincidere con TEMPO_MORTO nel
+# main.cpp: li' e' espresso in cicli da 0,5 s (20 cicli = 10 s). Governa solo
+# le clip innescate da uno stato pericoloso ("tipo=clip"): le registrazioni
+# manuali da 'r' ("tipo=rec") non passano da questo vincolo nel firmware.
+TEMPO_MORTO_CLIP = 10.0
 
 # Ordine con cui il firmware manda le probabilita' nel campo "p".
 # Deve coincidere con l'array CATEGORIE del main.cpp.
@@ -99,6 +113,11 @@ STATI = [
 ALLERTA_CAT = RILEVANZA.index("Vetri")
 ALLERTA_LINEA = LINEA.index("Vetri")
 ALLERTA_STATO = STATI.index("EMERGENZA")
+
+
+def nome_sicuro(testo):
+    """Ripulisce una stringa per usarla in un nome di file."""
+    return "".join(c if (c.isalnum() or c == "_") else "_" for c in testo)
 
 
 class Riproduttore(threading.Thread):
@@ -237,7 +256,14 @@ class RaccoglitoreClip:
     """Intercetta i marcatori del riversamento e scrive il WAV.
 
     Il Pico manda i campioni a 8 bit (gamma dinamica ridotta per stare nei
-    32 KB gia' allocati): qui si riportano a 16 bit per il file."""
+    32 KB gia' allocati): qui si riportano a 16 bit per il file.
+
+    Il nome del file riporta il TIPO di riversamento (clip di allerta o
+    registrazione manuale da 'r'), lo STATO della macchina a stati nel
+    momento in cui l'invio e' partito, e la data/ora del salvataggio. Lo
+    stato va impostato dall'esterno (da Cruscotto) PRIMA che arrivi la riga
+    "#AUDIO END", altrimenti resta "SCONOSCIUTO".
+    """
 
     def __init__(self, cartella):
         self.cartella = cartella
@@ -246,6 +272,8 @@ class RaccoglitoreClip:
         self.righe = []
         self.sr = 16000
         self.bits = 16
+        self.tipo = "clip"
+        self.stato_al_trigger = "SCONOSCIUTO"
         self.salvate = 0
         self.ultima = None
 
@@ -258,6 +286,8 @@ class RaccoglitoreClip:
                     self.sr = int(tok[3:])
                 elif tok.startswith("bits="):
                     self.bits = int(tok[5:])
+                elif tok.startswith("tipo="):
+                    self.tipo = tok[5:]
             return True
         if testo.startswith("#AUDIO END"):
             self.dentro = False
@@ -280,7 +310,9 @@ class RaccoglitoreClip:
             camp = [c * 16 for c in struct.unpack(f"<{n}h", grezzi[:n * 2])]
         camp = [max(-32768, min(32767, c)) for c in camp]
 
-        nome = time.strftime("clip_%Y%m%d_%H%M%S.wav")
+        stato = nome_sicuro(self.stato_al_trigger)
+        ora = time.strftime("%Y%m%d_%H%M%S")           # giorno + orario
+        nome = f"{self.tipo}_{stato}_{ora}.wav"
         percorso = os.path.join(self.cartella, nome)
         with wave.open(percorso, "wb") as w:
             w.setnchannels(1)
@@ -304,6 +336,9 @@ class Cruscotto:
         self.bande = []              # rettangoli disegnati, da rimuovere ogni giro
         self.testi = []
         self.ultimo = {}
+
+        self.stato_attuale = "QUIETE"          # ultimo stato noto della macchina
+        self.ultimo_trigger_clip = None        # istante (t locale) dell'ultima clip innescata
 
         self.lettore = LettoreSeriale()
         self.lettore.start()
@@ -349,6 +384,13 @@ class Cruscotto:
 
         self.testo = self.fig.text(0.01, 0.965, "", fontsize=9,
                                    color="#9aa0a6", family="monospace")
+
+        # Countdown della prossima clip disponibile: grande, in alto a destra,
+        # cosi' resta leggibile anche da lontano durante una presentazione.
+        self.testo_countdown = self.fig.text(
+            0.99, 0.965, "", fontsize=13, fontweight="bold",
+            color="#81c995", ha="right", va="top", family="monospace")
+
         self.fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     def _asse(self, ax, etichette, titolo, soglia):
@@ -366,8 +408,19 @@ class Cruscotto:
                 linea = self.lettore.righe.get_nowait()
             except queue.Empty:
                 return
+
+            era_start_clip = (linea.startswith("#AUDIO START")
+                              and " tipo=clip" in linea)
+            # Lo stato al momento dell'innesco va catturato PRIMA di chiamare
+            # clip.linea(), che per una riga di fine ("#AUDIO END") scrive
+            # subito il file: da quel momento clip.stato_al_trigger deve
+            # gia' contenere lo stato giusto.
             if self.clip.linea(linea):
+                if era_start_clip:
+                    self.clip.stato_al_trigger = self.stato_attuale
+                    self.ultimo_trigger_clip = time.time() - self.t0
                 continue                       # riga di riversamento audio
+
             if linea.startswith("#DEMO"):
                 print(f"[demo] ricevuto {linea}")
                 nome = self.demo.prossimo_nome()
@@ -378,12 +431,16 @@ class Cruscotto:
                 t = time.time() - self.t0
                 self.demo_eventi.append((t, t + DURATA_CIECA, nome))
                 continue
+
             try:
                 d = json.loads(linea)
             except json.JSONDecodeError:
                 if self.console:
                     print(linea)
                 continue
+
+            if d.get("stato") in STATI:
+                self.stato_attuale = d["stato"]
 
             # Nella finestra cieca il firmware marca "cieco":1. Quelle
             # letture non vengono proprio registrate: il Pico sente il clic
@@ -414,6 +471,20 @@ class Cruscotto:
             while dq and dq[0][0] < limite:
                 dq.popleft()
 
+    def _aggiorna_countdown(self, ora):
+        """Testo del countdown della prossima clip disponibile."""
+        if self.ultimo_trigger_clip is None:
+            self.testo_countdown.set_text("● PRONTO PER UNA CLIP")
+            self.testo_countdown.set_color("#81c995")
+            return
+        residuo = TEMPO_MORTO_CLIP - (ora - self.ultimo_trigger_clip)
+        if residuo <= 0:
+            self.testo_countdown.set_text("● PRONTO PER UNA CLIP")
+            self.testo_countdown.set_color("#81c995")
+        else:
+            self.testo_countdown.set_text(f"● PROSSIMA CLIP FRA {residuo:4.1f} s")
+            self.testo_countdown.set_color("#f28b82")
+
     @staticmethod
     def _agg(punti, passo):
         """Un punto per blocco, con l'indice PIU' ALTO. Con assi ordinati per
@@ -438,6 +509,21 @@ class Cruscotto:
     def aggiorna(self, _):
         self._consuma()
         ora = time.time() - self.t0
+
+        # Il countdown si aggiorna sempre, anche mentre una clip sta
+        # arrivando: e' proprio in quel momento che serve sapere quanto
+        # manca alla prossima.
+        self._aggiorna_countdown(ora)
+
+        # Pausa del rendering pesante durante la ricezione di una clip: sul
+        # portatile meno performante evita che i grafici rallentino il
+        # riversamento (che comunque non dipende dalla CPU della dashboard,
+        # ma ridisegnare mappa e bande ogni secondo mentre arrivano righe
+        # base64 e' inutile lavoro sprecato).
+        if self.clip.dentro:
+            self.testo.set_text("RICEZIONE CLIP IN CORSO... (grafica in pausa)")
+            return (self.testo, self.testo_countdown)
+
         self._taglia(ora)
 
         inizio_g = max(0.0, ora - self.finestra)
@@ -494,14 +580,16 @@ class Cruscotto:
         parti.append(f"clip salvate {self.clip.salvate}")
         if "clip_perse" in u:
             parti.append(f"perse {u['clip_perse']}")
-        if self.clip.dentro:
-            parti.append("RICEZIONE CLIP...")
+
         self.testo.set_text("      ".join(parti))
+
         return (self.img, self.p_fine, self.l_vinc, self.l_stato,
-                self.testo, *self.bande, *self.testi)
+                self.testo, self.testo_countdown, *self.bande, *self.testi)
 
     def avvia(self):
-        self.ani = FuncAnimation(self.fig, self.aggiorna, interval=250,
+        # Intervallo a 1000 ms: il grafico si ricalcola una volta al secondo
+        # invece di quattro, piu' leggero su un portatile meno performante.
+        self.ani = FuncAnimation(self.fig, self.aggiorna, interval=1000,
                                  blit=False, cache_frame_data=False)
         plt.show()
 
@@ -528,6 +616,8 @@ def main():
     ritardo = (DURATA_CIECA + MARGINE_DEMO) if args.ritardo is None else args.ritardo
     print(f"Il campione parte {ritardo:.1f} s dopo il clic, "
           f"cosi' l'attacco cade fuori dalla finestra cieca.")
+    print(f"Tempo morto fra due clip di allerta: {TEMPO_MORTO_CLIP:g} s "
+          f"(deve coincidere con TEMPO_MORTO nel firmware).")
     Cruscotto(args.finestra, args.aggrega, args.aggrega_classe,
               args.console, ritardo).avvia()
 
