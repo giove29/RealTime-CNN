@@ -71,6 +71,15 @@ MARGINE_DEMO = 0.3
 # manuali da 'r' ("tipo=rec") non passano da questo vincolo nel firmware.
 TEMPO_MORTO_CLIP = 17.0
 
+# Il riversamento di una clip BLOCCA Task_Serial per tutta la sua durata: se
+# il messaggio che riporta il nuovo stato pericoloso era gia' in coda quando
+# la clip inizia a essere inviata, resta bloccato dietro e arriva alla
+# dashboard solo DOPO che la clip ha finito di arrivare. Scrivere il file
+# subito a "#AUDIO END" significa quindi spesso usare uno stato vecchio.
+# Si aspetta questo margine dopo la fine della ricezione prima di scrivere
+# davvero il WAV, lasciando arrivare l'eventuale messaggio arretrato.
+RITARDO_NOME_STATO = 2.0
+
 # Ordine con cui il firmware manda le probabilita' nel campo "p".
 # Deve coincidere con l'array CATEGORIE del main.cpp.
 CLASSI_CNN = [
@@ -259,10 +268,13 @@ class RaccoglitoreClip:
     32 KB gia' allocati): qui si riportano a 16 bit per il file.
 
     Il nome del file riporta il TIPO di riversamento (clip di allerta o
-    registrazione manuale da 'r'), lo STATO della macchina a stati nel
-    momento in cui l'invio e' partito, e la data/ora del salvataggio. Lo
-    stato va impostato dall'esterno (da Cruscotto) PRIMA che arrivi la riga
-    "#AUDIO END", altrimenti resta "SCONOSCIUTO".
+    registrazione manuale da 'r'), lo STATO della macchina a stati, e la
+    data/ora del salvataggio. La scrittura vera e propria e' RITARDATA di
+    RITARDO_NOME_STATO secondi dopo la fine della ricezione: il riversamento
+    blocca Task_Serial, quindi il messaggio che riporta lo stato aggiornato
+    puo' restare in coda ed arrivare solo dopo che la clip e' arrivata tutta.
+    Aspettando un po', il nome usa lo stato piu' fresco possibile invece di
+    uno quasi certamente superato.
     """
 
     def __init__(self, cartella):
@@ -273,9 +285,11 @@ class RaccoglitoreClip:
         self.sr = 16000
         self.bits = 16
         self.tipo = "clip"
-        self.stato_al_trigger = "SCONOSCIUTO"
         self.salvate = 0
         self.ultima = None
+        # Clip decodificata ma non ancora scritta: aspetta che lo stato si
+        # assesti. None quando non c'e' nulla in sospeso.
+        self._in_sospeso = None      # (campioni, sr, tipo, pronta_da)
 
     def linea(self, testo):
         """True se la riga fa parte di un riversamento (e va nascosta)."""
@@ -291,14 +305,17 @@ class RaccoglitoreClip:
             return True
         if testo.startswith("#AUDIO END"):
             self.dentro = False
-            self._salva()
+            self._decodifica()
             return True
         if self.dentro:
             self.righe.append(testo)
             return True
         return False
 
-    def _salva(self):
+    def _decodifica(self):
+        """Decodifica subito i campioni (i dati grezzi non vanno persi),
+        ma NON scrive il file: lo fa verifica_scrittura() dopo il ritardo,
+        cosi' il nome usa lo stato piu' aggiornato possibile."""
         try:
             grezzi = base64.b64decode("".join(self.righe))
         except Exception:
@@ -309,19 +326,31 @@ class RaccoglitoreClip:
             n = len(grezzi) // 2
             camp = [c * 16 for c in struct.unpack(f"<{n}h", grezzi[:n * 2])]
         camp = [max(-32768, min(32767, c)) for c in camp]
+        self._in_sospeso = (camp, self.sr, self.tipo, time.time())
 
-        stato = nome_sicuro(self.stato_al_trigger)
+    def verifica_scrittura(self, stato_corrente):
+        """Chiamata a ogni giro dal Cruscotto. Se una clip e' in sospeso da
+        almeno RITARDO_NOME_STATO secondi, la scrive usando lo stato PIU'
+        AGGIORNATO disponibile in quel momento, non quello del trigger."""
+        if self._in_sospeso is None:
+            return
+        camp, sr, tipo, pronta_da = self._in_sospeso
+        if (time.time() - pronta_da) < RITARDO_NOME_STATO:
+            return
+        self._in_sospeso = None
+
+        stato = nome_sicuro(stato_corrente)
         ora = time.strftime("%Y%m%d_%H%M%S")           # giorno + orario
-        nome = f"{self.tipo}_{stato}_{ora}.wav"
+        nome = f"{tipo}_{stato}_{ora}.wav"
         percorso = os.path.join(self.cartella, nome)
         with wave.open(percorso, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(self.sr)
+            w.setframerate(sr)
             w.writeframes(struct.pack(f"<{len(camp)}h", *camp))
         self.salvate += 1
         self.ultima = nome
-        print(f"[clip] salvata {percorso}  ({len(camp)/self.sr:.1f} s)")
+        print(f"[clip] salvata {percorso}  ({len(camp)/sr:.1f} s)")
 
 
 class Cruscotto:
@@ -411,13 +440,11 @@ class Cruscotto:
 
             era_start_clip = (linea.startswith("#AUDIO START")
                               and " tipo=clip" in linea)
-            # Lo stato al momento dell'innesco va catturato PRIMA di chiamare
-            # clip.linea(), che per una riga di fine ("#AUDIO END") scrive
-            # subito il file: da quel momento clip.stato_al_trigger deve
-            # gia' contenere lo stato giusto.
             if self.clip.linea(linea):
                 if era_start_clip:
-                    self.clip.stato_al_trigger = self.stato_attuale
+                    # Serve solo al countdown: il nome del file non usa piu'
+                    # lo stato del trigger, ma quello assestato dopo il
+                    # ritardo (vedi RaccoglitoreClip.verifica_scrittura()).
                     self.ultimo_trigger_clip = time.time() - self.t0
                 continue                       # riga di riversamento audio
 
@@ -508,6 +535,12 @@ class Cruscotto:
 
     def aggiorna(self, _):
         self._consuma()
+        # Controlla se una clip in sospeso e' pronta per essere scritta con
+        # lo stato assestato. Va fatto anche mentre self.clip.dentro e'
+        # vero (nuovo riversamento in arrivo): il controllo e' innocuo se
+        # non c'e' nulla in sospeso, e non deve aspettare che l'eventuale
+        # nuova clip finisca di arrivare.
+        self.clip.verifica_scrittura(self.stato_attuale)
         ora = time.time() - self.t0
 
         # Il countdown si aggiorna sempre, anche mentre una clip sta
